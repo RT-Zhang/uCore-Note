@@ -1,4 +1,4 @@
-# LAB 1
+# Lab 1
 
 对应的 OS 原理
 
@@ -287,9 +287,11 @@ seta20.2:
     outb %al, $0x60                                 # 0xdf = 11011111, means set P2's A20 bit(the 1 bit) to 1
 ```
 
-### 初始化GDT表
+### 初始化GDT
 
-全局描述符表（Global Descriptor Table），段表可以包含8192 (2^13)个描述符，每个段最大空间为2^32字节。看起来很大，但实际上段并不能扩展物理地址空间，很大程度上各个段的地址空间是相互重叠的。没有太多实际意义。
+全局描述符表（Global Descriptor Table），由bootloader负责建立，GDTR寄存器保存地址。段描述符重要的两项：Base基址，Limit端的长度。uCore把这个功能弱化了，基址都为0，长度都为4GB。段表可以包含8192 (2^13)个描述符，每个段最大空间为2^32字节。看起来很大，但实际上段并不能扩展物理地址空间，很大程度上各个段的地址空间是相互重叠的。没有太多实际意义。
+
+段寄存器16位：前13位index，最后2位RPL（Requested Privilege Level）。0特权级为OS级别，3为应用程序。
 
 静态储存在引导区中，直接载入：
 
@@ -299,7 +301,7 @@ lgdt gdtdesc
 
 ### 进入保护模式
 
-将cr0寄存器的PE置1
+将控制寄存器CR0的PE置1
 
 ```assembly
 movl %cr0, %eax
@@ -310,13 +312,13 @@ movl %eax, %cr0
 通过长跳转更新cs的基地址
 
 ```assembly
-ljmp $PROT_MODE_CSEG, $protcseg  # PROT_MODE_CSEG kernel code 段选择器
+ljmp $PROT_MODE_CSEG, $protcseg  # PROT_MODE_CSEG 内核代码段选择器
 ```
 
 设置段寄存器，并建立堆栈
 
 ```assembly
-movw $PROT_MODE_DSEG, %ax  # PROT_MODE_DSEG kernel data 段选择器
+movw $PROT_MODE_DSEG, %ax  # PROT_MODE_DSEG 内核数据段选择器
 movw %ax, %ds
 movw %ax, %es
 movw %ax, %fs
@@ -332,9 +334,201 @@ movl $start, %esp
  call bootmain
 ```
 
+## 练习4：bootloader加载ELF格式OS
+
+### 读取硬盘扇区
+
+为了简单，bootloader访问硬盘都采用LBA模式的PIO（Program IO）方式，即所有的IO操作是通过CPU访问硬盘的IO地址寄存器完成。这是较早的硬盘数据传输模式，数据传输速率低，CPU占有率也高。
+
+分析如以下注释：
+
+```c
+/* readsect - read a single sector at @secno into @dst */
+static void
+readsect(void *dst, uint32_t secno) {
+    // wait for disk to be ready
+    waitdisk();
+
+    // outb参见libs/x86.h中的内联汇编
+    outb(0x1F2, 1);  // 要读写的扇区数，每次读写前，你需要表明你要读写几个扇区。最小是1个扇区
+    outb(0x1F3, secno & 0xFF);			// LBA参数的0-7位
+    outb(0x1F4, (secno >> 8) & 0xFF);	// LBA参数的8-15位
+    outb(0x1F5, (secno >> 16) & 0xFF);	// LBA参数的16-23位
+    outb(0x1F6, ((secno >> 24) & 0xF) | 0xE0);  // 第0~3位：LBA4-27位 第4位：为0主盘；为1从盘
+    outb(0x1F7, 0x20);                      // 命令 0x20 - 读扇区
+
+    // wait for disk to be ready
+    waitdisk();
+
+    // read a sector
+    insl(0x1F0, dst, SECTSIZE / 4);  // 单位是DW双字，除以4
+}
+```
+
+读一个扇区的流程如下：
+
+* 等待磁盘准备好
+* 发出读取扇区的命令
+* 等待磁盘准备好
+* 把磁盘扇区数据读到指定内存
+
+包装一下readsect，方便从设备读取任意长度的内容。从内核偏移@offset处读取@count字节至虚拟地址@va：
+
+```c
+static void
+readseg(uintptr_t va, uint32_t count, uint32_t offset) {
+    uintptr_t end_va = va + count;
+
+    // round down to sector boundary
+    va -= offset % SECTSIZE;
+
+    // translate from bytes to sectors; kernel starts at sector 1
+    uint32_t secno = (offset / SECTSIZE) + 1;
+
+    // If this is too slow, we could read lots of sectors at a time.
+    // We'd write more to memory than asked, but it doesn't matter --
+    // we load in increasing order.
+    for (; va < end_va; va += SECTSIZE, secno ++) {
+        readsect((void *)va, secno);
+    }
+}
+
+```
+
+### 加载ELF格式的OS
+
+#### ELF格式简介
+
+ELF(Executable and linking format)文件格式是Linux系统下的一种常用目标文件(object file)格式。本实验只涉及用于执行的可执行文件，用于提供程序的进程映像，加载的内存执行。
+
+ELF header在文件开始处描述了整个文件的组织，列出重点的成员，elf.h：
+
+```c
+struct elfhdr {
+    uint32_t e_magic;     // must equal ELF_MAGIC
+    uint32_t e_entry;     // 程序入口的虚拟地址
+    uint32_t e_phoff;     // program header表偏移位置
+    uint16_t e_phnum;     // program header表入口数目
+    ...
+};
+```
+
+program header描述与程序执行直接相关的目标文件结构信息，用来在文件中定位**各个段**的映像，同时包含其他一些用来为程序创建进程映像所必需的信息。
+
+```c
+struct proghdr {
+    uint32_t p_type;   // 段类型 loadable code or data, dynamic linking info,etc.
+    uint32_t p_offset; // 段相对文件头的偏移值
+    uint32_t p_va;     // 段的第一个字节将被放到内存中的虚拟地址
+    uint32_t p_memsz;  // 段在内存中占用的字节数 (bigger if contains bss）
+    ...
+};
+```
 
 
 
+bootmain是bootloader的入口
 
+```c
+void bootmain(void) {
+    // read the 1st page off disk
+    readseg((uintptr_t)ELFHDR, SECTSIZE * 8, 0);  // 读ELF头部
 
+    // 通过储存在头部的幻数判断是否是合法的ELF文件
+    if (ELFHDR->e_magic != ELF_MAGIC) {
+        goto bad;
+    }
+
+    struct proghdr *ph, *eph;  // 程序段头
+
+    // ELF头部有描述ELF文件应加载到内存什么位置的描述表，先将描述表的头地址存在ph（program header）
+    ph = (struct proghdr *)((uintptr_t)ELFHDR + ELFHDR->e_phoff);  // ELFHDR是struct elfhdr*类型，先强转为uintptr_t（就是unsigned int），加偏移量后强转为struct proghdr*
+    eph = ph + ELFHDR->e_phnum;  // 注意类型是struct proghdr*，+1会增加sizeof(struct proghdr*)个字节
+    for (; ph < eph; ph ++) {  // 按照描述表将ELF文件中数据载入内存
+        readseg(ph->p_va & 0xFFFFFF, ph->p_memsz, ph->p_offset);
+    }
+
+    // call the entry point from the ELF header
+    // note: does not return
+    ((void (*)(void))(ELFHDR->e_entry & 0xFFFFFF))();  // 强转为函数指针，调用ELF入口
+
+bad:
+    outw(0x8A00, 0x8A00);
+    outw(0x8A00, 0x8E00);
+    while (1);
+}
+```
+
+## 练习5：函数调用堆栈跟踪函数
+
+实现kdebug.c中的函数print_stackframe，可以通过它来跟踪函数调用堆栈中记录的返回地址。
+
+```c
+void print_stackframe(void) {
+    uint32_t ebp = read_ebp();
+    uint32_t eip = read_eip();
+    // 从0到STACKFRAME_DEPTH（20）
+    for (int i = 0; i < STACKFRAME_DEPTH && ebp != 0; i++) {
+        cprintf("ebp: 0x%08x eip: 0x%08x args: ", ebp, eip);
+        uint32_t* args = (uint32_t)ebp + 2;  // args基址
+        for (int j = 0; j < 4; j++) {
+            cprintf("0x%08x ", args[j]);  // 打印args
+        }
+        cprintf("\n");
+        print_debuginfo(eip - 1);  // 查找对应函数名并打印至屏幕
+
+        // 弹出一个栈帧
+        eip = ((uint32_t*)ebp)[1];  // 返回地址
+        ebp = ((uint32_t*)ebp)[0];
+    }
+}
+```
+
+make qemu运行，观察最深一层为：
+
+```bash
+ebp: 0x00007bf8 eip: 0x00007d72 args: 0x7c4f0000 0xfcfa0000 0xd88ec031 0xd08ec08e 
+    <unknow>: -- 0x00007d71 --
+```
+
+第一个函数bootmain.c中的bootmain，bootloader设置的堆栈从0x7C00开始
+
+```assembly
+call bootmain
+```
+
+call指令先将返回地址压栈（虽然不应该会返回），再将当前的ebp压栈，所以栈顶esp就是0x7c00 - 0x8 = 0x7bf8。在bootmain的入口，
+
+```assembly
+mov %esp %ebp
+```
+
+所以bootmain的ebp为0x7bf8。
+
+## 练习6：中断初始化和处理
+
+完善kern/trap/trap.c中对中断向量表进行初始化的函数idt_init
+
+```c
+void idt_init(void) {
+    extern uintptr_t __vectors[];  // ISR入口地址都在__vectors中，进行外部引用
+    // SETGATE宏设置IDT的每项
+    for (int i = 0; i < sizeof(idt) / sizeof(struct gatedesc); i++) {
+        SETGATE(idt[i], 0, GD_KTEXT, __vectors[i], DPL_KERNEL);
+    }
+    SETGATE(idt[T_SWITCH_TOK], 0, GD_KTEXT, __vectors[T_SWITCH_TOK], DPL_USER);
+    lidt(&idt_pd);  // lidt指令（Load Interrupt Descriptor Table Register），让CPU知道IDT在哪
+}
+```
+
+完善trap.c中的中断处理函数trap中的时钟中断处理
+
+```c
+case IRQ_OFFSET + IRQ_TIMER:
+        ticks++;  // 记录这个事件，每次加一
+        if (ticks % TICK_NUM == 0) {  // 每TICK_NUM（100）次，打印
+            print_ticks();
+        }
+        break;
+```
 
