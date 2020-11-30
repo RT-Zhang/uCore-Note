@@ -12,3 +12,7 @@
 [Lab5](Lab5.md)
 
 [Lab6](Lab6.md)
+
+[Lab7](Lab7.md)
+
+[Lab8](Lab8.md)
