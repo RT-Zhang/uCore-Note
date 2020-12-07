@@ -15,4 +15,7 @@
 
 [Lab7](Lab7.md)
 
-[Lab8](Lab8.md)
+[Lab8](Lab7.md)
+
+[ucore on MIPS](ucore_mips.md)
+
