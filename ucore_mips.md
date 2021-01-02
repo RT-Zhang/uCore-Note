@@ -338,7 +338,7 @@ mips_mipssim_init(MachineState *machine) {
 
 在 mipssim 中，将串口接受数据的端口寄存器映射到 ISA BASE 偏移 0x3f8 的虚拟地址上，即操作系统往虚拟地址 0xbfd003f8 上传输数据，QEMU 就能通过串口接受到相对应的数据。
 
-因为 printf 是直接往串口上，也就是往指定地址上传输数据，为了方便采用 MIPS 内联汇编来实现操作系统对于指定地址数据的读取和写入。同时为了最小地改动原本 ucore 在 x86 架构下的代码，对 x86 的 I/O 特殊读取、写入指令（inb、outb）进行了重新定义。具体 ucore 对于 inb 和 outb 的实现代码（libs/x86.h）如下：
+因为 printf 是直接往串口上，也就是往指定地址上传输数据，为了方便采用 MIPS 内联汇编来实现操作系统对于指定地址数据的读取和写入。同时为了最小地改动原本 ucore 在 x86 架构下的代码，对 x86 的 I/O 特殊读取、写入指令（inb、outb）进行了重新定义。具体 ucore 对于 inb 和 outb 的实现代码如下：
 
 ```c
 static inline uint8_t
@@ -366,7 +366,7 @@ serial_init(void) {
     // Set speed; requires DLAB latch
     outb(COM1 + COM_LCR, COM_LCR_DLAB);
     outb(COM1 + COM_DLL, (uint8_t) (115200 / 9600));
-    outb(COM1 + COM_DLM, 0);
+    outb(COM1 + COM_DLH, 0);
 
     // 8 data bits, 1 stop bit, parity off; turn off DLAB latch
     outb(COM1 + COM_LCR, COM_LCR_WLEN8 & ~COM_LCR_DLAB);
@@ -378,9 +378,15 @@ serial_init(void) {
 }
 ```
 
-随着 Windows NT以及各种 UNIX 这类的多任务操作系统进入个人电脑，8250 每个字符触发一次的高频中断成为了问题，因此16550(A)内置了 16 字节的 FIFO 数据缓存器用于收集收到的数据。在串口初始化时先将其关闭。
+FCR(FIFO Control Register)寄存器相对较新，并不是最初的 8250 UART 的一部分。随着 Windows NT以及各种 UNIX 这类的多任务操作系统进入个人电脑，8250 每个字符触发一次的高频中断成为了问题，因此16550(A)内置了 16 字节的 FIFO 数据缓存器用于收集收到的数据。在串口初始化时先将其关闭。
 
-要设置速度，需要先将 LCR 寄存器的 DLAB 位置 1，再通过 DLL 和 DLM 两个寄存器设置速度。设置每个字传输 8 比特，1 stop bit，最后恢复 DLAB 的值为 0。这里的 stop bit 其实是指时间间隔，在 50 baud 情况下，1 bit 代表 20ms。
+需要先将 LCR(Line Control Register) 寄存器的 DLAB(Divisor Latch Access Bit) 位置 1，才可以设置速度（也就是baud rate）。再通过 DLL(Divisor Latch Low Byte) 和 DLH(Divisor Latch High Byte) 两个寄存器设置速度的低位和高位。顾名思义，divisor 意味着这个值将作为除数来决定传输速率，DLB的值与传输速率遵循以下关系。
+$$
+DivisorLatchValue=\frac{115200}{BaudRate}
+$$
+所以这里实际上将传输速率为 9600。
+
+设置每个字传输 8 比特，1 个停止比特（stop bit）。这里的停止比特其实是指时间间隔，在 50 baud 情况下，1 bit 的传输耗时 1s/50 = 20ms。关闭奇偶校验位，也就是代码注释中的 parity。最后恢复 DLAB 的值为 0
 
 设置 IER 寄存器的 RDI 位为 1。IER(Interrupt Enable Register)寄存器用于控制中断，RDI 负责开启 Received Data Available Interrupt，这个中断告知我们有数据可以从 UART 获取。
 
@@ -421,7 +427,7 @@ __exception_vector_end:
 */
 ```
 
-RVECENT 和 XVECENT 这两个宏实际上都是无条件跳转
+RVECENT 和 XVECENT 这两个宏实际上都是无条件跳转。
 
 ### 异常处理流程
 
