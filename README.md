@@ -19,3 +19,5 @@
 
 [ucore on MIPS](ucore_mips.md)
 
+[uCore问题汇总](uCore问题.md)
+
